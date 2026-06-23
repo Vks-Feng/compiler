@@ -1,0 +1,21 @@
+# Local agent/workspace metadata
+.agents/
+.codex/
+
+# Build outputs
+target/
+*.class
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# IDE/editor files
+.idea/
+.vscode/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
