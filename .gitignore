@@ -1,6 +1,7 @@
 # Local agent/workspace metadata
 .agents/
 .codex/
+local/
 
 # Build outputs
 target/
