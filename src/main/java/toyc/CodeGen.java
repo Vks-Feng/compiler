@@ -12,6 +12,8 @@ final class CodeGen {
     private static final String[] LOCAL_REGISTERS = {
             "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
     };
+    // t0/t1 are expression scratch registers; leaf-function locals can use the remaining temporaries.
+    private static final String[] LEAF_REGISTERS = {"t2", "t3", "t4", "t5", "t6"};
 
     private record CachedExpr(String source, Set<String> dependencies) {}
 
@@ -85,9 +87,10 @@ final class CodeGen {
 
     private void emitFunc(FuncDef f) {
         int localCount = f.params.size() + countVars(f.body);
-        localRegisters = chooseLocalRegisters(f);
-        usedLocalRegs = localRegisters.size();
-        int stackSlots = Math.max(0, localCount - usedLocalRegs);
+        boolean leaf = !containsCall(f.body);
+        localRegisters = chooseLocalRegisters(f, leaf ? LEAF_REGISTERS : LOCAL_REGISTERS);
+        usedLocalRegs = leaf ? 0 : localRegisters.size();
+        int stackSlots = Math.max(0, localCount - localRegisters.size());
         int frame = align16(8 + stackSlots * 4 + usedLocalRegs * 4);
         localIndex = 0;
         endLabel = label(".Lend_" + f.name);
@@ -143,7 +146,7 @@ final class CodeGen {
         return 0;
     }
 
-    private Map<String, String> chooseLocalRegisters(FuncDef f) {
+    private Map<String, String> chooseLocalRegisters(FuncDef f, String[] registerPool) {
         Map<String, Integer> declarations = new HashMap<>();
         Map<String, Integer> uses = new HashMap<>();
         for (String param : f.params) {
@@ -163,8 +166,8 @@ final class CodeGen {
         });
 
         Map<String, String> result = new LinkedHashMap<>();
-        for (int i = 0; i < candidates.size() && i < LOCAL_REGISTERS.length; i++) {
-            result.put(candidates.get(i), LOCAL_REGISTERS[i]);
+        for (int i = 0; i < candidates.size() && i < registerPool.length; i++) {
+            result.put(candidates.get(i), registerPool[i]);
         }
         return result;
     }
@@ -874,6 +877,27 @@ final class CodeGen {
         if (expr instanceof CallExpr) return true;
         if (expr instanceof UnaryExpr u) return containsCall(u.expr);
         if (expr instanceof BinaryExpr b) return containsCall(b.left) || containsCall(b.right);
+        return false;
+    }
+
+    private boolean containsCall(Stmt stmt) {
+        if (stmt instanceof Block b) {
+            for (Stmt s : b.stmts) {
+                if (containsCall(s)) return true;
+            }
+        } else if (stmt instanceof ExprStmt e) {
+            return containsCall(e.expr);
+        } else if (stmt instanceof AssignStmt a) {
+            return containsCall(a.expr);
+        } else if (stmt instanceof DeclStmt d) {
+            return containsCall(d.decl.init);
+        } else if (stmt instanceof IfStmt i) {
+            return containsCall(i.cond) || containsCall(i.thenStmt) || (i.elseStmt != null && containsCall(i.elseStmt));
+        } else if (stmt instanceof WhileStmt w) {
+            return containsCall(w.cond) || containsCall(w.body);
+        } else if (stmt instanceof ReturnStmt r && r.expr != null) {
+            return containsCall(r.expr);
+        }
         return false;
     }
 
