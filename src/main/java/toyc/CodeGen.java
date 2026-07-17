@@ -1,10 +1,22 @@
 package toyc;
 
 import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 
 final class CodeGen {
+    private static final String[] LOCAL_REGISTERS = {
+            "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"
+    };
+
+    private record CachedExpr(String source, Set<String> dependencies) {}
+
+    private record ExprInfo(String key, Set<String> dependencies) {}
+
     private final Program program;
     private final StringBuilder asm = new StringBuilder();
     private final Scope scope = new Scope();
@@ -12,9 +24,15 @@ final class CodeGen {
     private final Map<String, FuncDef> funcs = new LinkedHashMap<>();
     private int labelId;
     private int localIndex;
+    private int usedLocalRegs;
+    private Map<String, String> localRegisters = Map.of();
     private String endLabel;
+    private String functionBodyLabel;
+    private FuncDef currentFunc;
+    private Symbol[] currentParams;
     private final ArrayDeque<String> breakLabels = new ArrayDeque<>();
     private final ArrayDeque<String> continueLabels = new ArrayDeque<>();
+    private final ArrayDeque<Map<String, CachedExpr>> expressionCaches = new ArrayDeque<>();
 
     CodeGen(Program program) {
         this.program = program;
@@ -30,13 +48,21 @@ final class CodeGen {
     }
 
     private void collectGlobalsAndFuncs() {
+        Set<String> globalNames = new HashSet<>();
+        for (Top top : program.tops) {
+            if (top instanceof Decl d) globalNames.add(d.name);
+        }
+        Set<String> writtenGlobals = findWrittenGlobals(globalNames);
         for (Top top : program.tops) {
             if (top instanceof FuncDef f) {
                 funcs.put(f.name, f);
                 scope.put(f.name, Symbol.func(f.returnsInt));
-            } else if (top instanceof Decl d) {
+            }
+        }
+        for (Top top : program.tops) {
+            if (top instanceof Decl d) {
                 int value = evalConst(d.init);
-                if (d.isConst) {
+                if (d.isConst || !writtenGlobals.contains(d.name)) {
                     scope.put(d.name, Symbol.constant(value));
                 } else {
                     String label = "g_" + d.name;
@@ -58,34 +84,51 @@ final class CodeGen {
     }
 
     private void emitFunc(FuncDef f) {
-        int slots = f.params.size() + countVars(f.body);
-        int frame = align16(8 + slots * 4);
+        int localCount = f.params.size() + countVars(f.body);
+        localRegisters = chooseLocalRegisters(f);
+        usedLocalRegs = localRegisters.size();
+        int stackSlots = Math.max(0, localCount - usedLocalRegs);
+        int frame = align16(8 + stackSlots * 4 + usedLocalRegs * 4);
         localIndex = 0;
         endLabel = label(".Lend_" + f.name);
+        functionBodyLabel = label(".Lbody_" + f.name);
+        currentFunc = f;
+        currentParams = new Symbol[f.params.size()];
         scope.push();
         asm.append(f.name).append(":\n");
         asm.append("  addi sp, sp, -").append(frame).append('\n');
+        for (int i = 0; i < usedLocalRegs; i++) {
+            asm.append("  sw ").append(LOCAL_REGISTERS[i]).append(", ").append(i * 4).append("(sp)\n");
+        }
         asm.append("  sw ra, ").append(frame - 4).append("(sp)\n");
         asm.append("  sw s0, ").append(frame - 8).append("(sp)\n");
         asm.append("  addi s0, sp, ").append(frame).append('\n');
         for (int i = 0; i < f.params.size(); i++) {
-            int off = allocSlot();
-            scope.put(f.params.get(i), Symbol.var(false, off, null));
+            Symbol param = allocLocal(f.params.get(i));
+            currentParams[i] = param;
+            scope.put(f.params.get(i), param);
             if (i < 8) {
-                asm.append("  sw a").append(i).append(", ").append(off).append("(s0)\n");
+                storeSymbolFromReg(param, "a" + i);
             } else {
                 asm.append("  lw t0, ").append((i - 8) * 4).append("(s0)\n");
-                asm.append("  sw t0, ").append(off).append("(s0)\n");
+                storeSymbolFromReg(param, "t0");
             }
         }
+        asm.append(functionBodyLabel).append(":\n");
         emitBlock(f.body);
         if (!f.returnsInt) asm.append("  li a0, 0\n");
         asm.append(endLabel).append(":\n");
         asm.append("  lw ra, ").append(frame - 4).append("(sp)\n");
         asm.append("  lw s0, ").append(frame - 8).append("(sp)\n");
+        for (int i = 0; i < usedLocalRegs; i++) {
+            asm.append("  lw ").append(LOCAL_REGISTERS[i]).append(", ").append(i * 4).append("(sp)\n");
+        }
         asm.append("  addi sp, sp, ").append(frame).append('\n');
         asm.append("  ret\n");
         scope.pop();
+        currentFunc = null;
+        currentParams = null;
+        localRegisters = Map.of();
     }
 
     private int countVars(Stmt stmt) {
@@ -100,25 +143,116 @@ final class CodeGen {
         return 0;
     }
 
+    private Map<String, String> chooseLocalRegisters(FuncDef f) {
+        Map<String, Integer> declarations = new HashMap<>();
+        Map<String, Integer> uses = new HashMap<>();
+        for (String param : f.params) {
+            declarations.merge(param, 1, Integer::sum);
+            uses.merge(param, 1, Integer::sum);
+        }
+        collectLocalDeclarations(f.body, declarations);
+        collectUses(f.body, uses);
+
+        java.util.ArrayList<String> candidates = new java.util.ArrayList<>();
+        for (Map.Entry<String, Integer> entry : declarations.entrySet()) {
+            if (entry.getValue() == 1) candidates.add(entry.getKey());
+        }
+        candidates.sort((a, b) -> {
+            int byUse = Integer.compare(uses.getOrDefault(b, 0), uses.getOrDefault(a, 0));
+            return byUse != 0 ? byUse : a.compareTo(b);
+        });
+
+        Map<String, String> result = new LinkedHashMap<>();
+        for (int i = 0; i < candidates.size() && i < LOCAL_REGISTERS.length; i++) {
+            result.put(candidates.get(i), LOCAL_REGISTERS[i]);
+        }
+        return result;
+    }
+
+    private void collectLocalDeclarations(Stmt stmt, Map<String, Integer> declarations) {
+        if (stmt instanceof DeclStmt d) {
+            if (!d.decl.isConst) declarations.merge(d.decl.name, 1, Integer::sum);
+        } else if (stmt instanceof Block b) {
+            for (Stmt s : b.stmts) collectLocalDeclarations(s, declarations);
+        } else if (stmt instanceof IfStmt i) {
+            collectLocalDeclarations(i.thenStmt, declarations);
+            if (i.elseStmt != null) collectLocalDeclarations(i.elseStmt, declarations);
+        } else if (stmt instanceof WhileStmt w) {
+            collectLocalDeclarations(w.body, declarations);
+        }
+    }
+
+    private void collectUses(Stmt stmt, Map<String, Integer> uses) {
+        if (stmt instanceof Block b) {
+            for (Stmt s : b.stmts) collectUses(s, uses);
+        } else if (stmt instanceof ExprStmt e) {
+            collectUses(e.expr, uses);
+        } else if (stmt instanceof AssignStmt a) {
+            uses.merge(a.name, 1, Integer::sum);
+            collectUses(a.expr, uses);
+        } else if (stmt instanceof DeclStmt d) {
+            collectUses(d.decl.init, uses);
+        } else if (stmt instanceof IfStmt i) {
+            collectUses(i.cond, uses);
+            collectUses(i.thenStmt, uses);
+            if (i.elseStmt != null) collectUses(i.elseStmt, uses);
+        } else if (stmt instanceof WhileStmt w) {
+            collectUses(w.cond, uses);
+            collectUses(w.body, uses);
+        } else if (stmt instanceof ReturnStmt r && r.expr != null) {
+            collectUses(r.expr, uses);
+        }
+    }
+
+    private void collectUses(Expr expr, Map<String, Integer> uses) {
+        if (expr instanceof VarExpr v) {
+            uses.merge(v.name, 1, Integer::sum);
+        } else if (expr instanceof CallExpr c) {
+            for (Expr arg : c.args) collectUses(arg, uses);
+        } else if (expr instanceof UnaryExpr u) {
+            collectUses(u.expr, uses);
+        } else if (expr instanceof BinaryExpr b) {
+            collectUses(b.left, uses);
+            collectUses(b.right, uses);
+        }
+    }
+
     private int allocSlot() {
         localIndex++;
         return -8 - localIndex * 4;
+    }
+
+    private Symbol allocLocal(String name) {
+        String register = localRegisters.get(name);
+        if (register != null) return Symbol.local(register, 0);
+        return Symbol.local(null, allocSlot());
     }
 
     private void emitStmt(Stmt stmt) {
         if (stmt instanceof Block b) emitBlock(b);
         else if (stmt instanceof EmptyStmt) {
             // no-op
-        } else if (stmt instanceof ExprStmt e) emitExpr(e.expr);
-        else if (stmt instanceof AssignStmt a) {
-            emitExpr(a.expr);
-            storeVar(a.name);
-        } else if (stmt instanceof DeclStmt d) emitDecl(d.decl);
-        else if (stmt instanceof IfStmt i) emitIf(i);
-        else if (stmt instanceof WhileStmt w) emitWhile(w);
+        } else if (stmt instanceof ExprStmt e) {
+            if (containsCall(e.expr)) clearExprCache();
+            emitExpr(e.expr);
+        } else if (stmt instanceof AssignStmt a) emitAssign(a);
+        else if (stmt instanceof DeclStmt d) emitDecl(d.decl);
+        else if (stmt instanceof IfStmt i) {
+            clearExprCache();
+            emitIf(i);
+            clearExprCache();
+        } else if (stmt instanceof WhileStmt w) {
+            clearExprCache();
+            emitWhile(w);
+            clearExprCache();
+        }
         else if (stmt instanceof BreakStmt) asm.append("  j ").append(breakLabels.peek()).append('\n');
         else if (stmt instanceof ContinueStmt) asm.append("  j ").append(continueLabels.peek()).append('\n');
         else if (stmt instanceof ReturnStmt r) {
+            if (r.expr instanceof CallExpr c && currentFunc != null && c.name.equals(currentFunc.name)) {
+                emitTailCall(c);
+                return;
+            }
             if (r.expr != null) emitExpr(r.expr);
             else asm.append("  li a0, 0\n");
             asm.append("  j ").append(endLabel).append('\n');
@@ -127,7 +261,12 @@ final class CodeGen {
 
     private void emitBlock(Block b) {
         scope.push();
-        for (Stmt s : b.stmts) emitStmt(s);
+        expressionCaches.push(new HashMap<>());
+        for (Stmt s : b.stmts) {
+            emitStmt(s);
+            if (alwaysTerminates(s)) break;
+        }
+        expressionCaches.pop();
         scope.pop();
     }
 
@@ -136,27 +275,34 @@ final class CodeGen {
             scope.put(d.name, Symbol.constant(evalConst(d.init)));
             return;
         }
-        int off = allocSlot();
-        scope.put(d.name, Symbol.var(false, off, null));
-        emitExpr(d.init);
-        asm.append("  sw a0, ").append(off).append("(s0)\n");
+        Symbol local = allocLocal(d.name);
+        scope.put(d.name, local);
+        emitValue(d.init);
+        storeSymbolFromReg(local, "a0");
+        cacheExpr(d.name, d.init);
+    }
+
+    private void emitAssign(AssignStmt a) {
+        emitValue(a.expr);
+        storeVar(a.name);
+        cacheExpr(a.name, a.expr);
     }
 
     private void emitIf(IfStmt i) {
         Integer cond = tryEvalConst(i.cond);
         if (cond != null) {
-            if (cond != 0) emitStmt(i.thenStmt);
-            else if (i.elseStmt != null) emitStmt(i.elseStmt);
+            if (cond != 0) emitStmtInFreshCache(i.thenStmt);
+            else if (i.elseStmt != null) emitStmtInFreshCache(i.elseStmt);
             return;
         }
         String elseLabel = label(".Lelse");
         String done = label(".Lendif");
         emitBranchIfFalse(i.cond, i.elseStmt == null ? done : elseLabel);
-        emitStmt(i.thenStmt);
+        emitStmtInFreshCache(i.thenStmt);
         if (i.elseStmt != null) asm.append("  j ").append(done).append('\n');
         if (i.elseStmt != null) {
             asm.append(elseLabel).append(":\n");
-            emitStmt(i.elseStmt);
+            emitStmtInFreshCache(i.elseStmt);
         }
         asm.append(done).append(":\n");
     }
@@ -170,11 +316,17 @@ final class CodeGen {
         continueLabels.push(begin);
         asm.append(begin).append(":\n");
         emitBranchIfFalse(w.cond, done);
-        emitStmt(w.body);
+        emitStmtInFreshCache(w.body);
         asm.append("  j ").append(begin).append('\n');
         asm.append(done).append(":\n");
         continueLabels.pop();
         breakLabels.pop();
+    }
+
+    private void emitStmtInFreshCache(Stmt stmt) {
+        expressionCaches.push(new HashMap<>());
+        emitStmt(stmt);
+        expressionCaches.pop();
     }
 
     private void emitExpr(Expr expr) {
@@ -590,6 +742,21 @@ final class CodeGen {
         if (bytes > 0) asm.append("  addi sp, sp, ").append(bytes).append('\n');
     }
 
+    private void emitTailCall(CallExpr c) {
+        int bytes = align16(c.args.size() * 4);
+        if (bytes > 0) asm.append("  addi sp, sp, -").append(bytes).append('\n');
+        for (int i = 0; i < c.args.size(); i++) {
+            emitExpr(c.args.get(i));
+            asm.append("  sw a0, ").append(i * 4).append("(sp)\n");
+        }
+        for (int i = 0; i < currentParams.length; i++) {
+            asm.append("  lw t0, ").append(i * 4).append("(sp)\n");
+            storeSymbolFromReg(currentParams[i], "t0");
+        }
+        if (bytes > 0) asm.append("  addi sp, sp, ").append(bytes).append('\n');
+        asm.append("  j ").append(functionBodyLabel).append('\n');
+    }
+
     private void loadVar(String name) {
         loadVarToReg(name, "a0");
     }
@@ -601,6 +768,8 @@ final class CodeGen {
         } else if (s.global) {
             asm.append("  la t0, ").append(s.label).append('\n');
             asm.append("  lw ").append(reg).append(", 0(t0)\n");
+        } else if (s.register != null) {
+            if (!s.register.equals(reg)) asm.append("  mv ").append(reg).append(", ").append(s.register).append('\n');
         } else {
             asm.append("  lw ").append(reg).append(", ").append(s.offset).append("(s0)\n");
         }
@@ -609,12 +778,145 @@ final class CodeGen {
     private void storeVar(String name) {
         Symbol s = scope.get(name);
         if (s.kind == SymKind.CONST) throw new RuntimeException("cannot assign const: " + name);
+        storeSymbolFromReg(s, "a0");
+    }
+
+    private void storeSymbolFromReg(Symbol s, String reg) {
         if (s.global) {
             asm.append("  la t0, ").append(s.label).append('\n');
-            asm.append("  sw a0, 0(t0)\n");
+            asm.append("  sw ").append(reg).append(", 0(t0)\n");
+        } else if (s.register != null) {
+            if (!s.register.equals(reg)) asm.append("  mv ").append(s.register).append(", ").append(reg).append('\n');
         } else {
-            asm.append("  sw a0, ").append(s.offset).append("(s0)\n");
+            asm.append("  sw ").append(reg).append(", ").append(s.offset).append("(s0)\n");
         }
+    }
+
+    private boolean alwaysTerminates(Stmt stmt) {
+        if (stmt instanceof ReturnStmt || stmt instanceof BreakStmt || stmt instanceof ContinueStmt) return true;
+        if (stmt instanceof Block b) {
+            for (Stmt s : b.stmts) {
+                if (alwaysTerminates(s)) return true;
+            }
+            return false;
+        }
+        if (stmt instanceof IfStmt i) {
+            return i.elseStmt != null && alwaysTerminates(i.thenStmt) && alwaysTerminates(i.elseStmt);
+        }
+        return false;
+    }
+
+    private void emitValue(Expr expr) {
+        if (containsCall(expr)) clearExprCache();
+        ExprInfo info = pureExprInfo(expr);
+        CachedExpr cached = info == null || expressionCaches.isEmpty() ? null : expressionCaches.peek().get(info.key);
+        if (cached != null) {
+            loadVar(cached.source);
+        } else {
+            emitExpr(expr);
+        }
+    }
+
+    private void cacheExpr(String target, Expr expr) {
+        if (expressionCaches.isEmpty()) return;
+        invalidateExprCache(target);
+        ExprInfo info = pureExprInfo(expr);
+        if (info != null && !info.dependencies.contains(target)) {
+            expressionCaches.peek().put(info.key, new CachedExpr(target, info.dependencies));
+        }
+    }
+
+    private void invalidateExprCache(String name) {
+        if (expressionCaches.isEmpty()) return;
+        expressionCaches.peek().entrySet().removeIf(entry ->
+                entry.getValue().source.equals(name) || entry.getValue().dependencies.contains(name));
+    }
+
+    private void clearExprCache() {
+        if (!expressionCaches.isEmpty()) expressionCaches.peek().clear();
+    }
+
+    private ExprInfo pureExprInfo(Expr expr) {
+        Set<String> dependencies = new LinkedHashSet<>();
+        String key = pureExprKey(expr, dependencies);
+        return key == null ? null : new ExprInfo(key, dependencies);
+    }
+
+    private String pureExprKey(Expr expr, Set<String> dependencies) {
+        if (expr instanceof NumExpr n) return "#" + n.value;
+        if (expr instanceof VarExpr v) {
+            dependencies.add(v.name);
+            return "$" + v.name;
+        }
+        if (expr instanceof CallExpr) return null;
+        if (expr instanceof UnaryExpr u) {
+            String value = pureExprKey(u.expr, dependencies);
+            return value == null ? null : "u" + u.op + "(" + value + ")";
+        }
+        if (expr instanceof BinaryExpr b) {
+            String left = pureExprKey(b.left, dependencies);
+            if (left == null) return null;
+            String right = pureExprKey(b.right, dependencies);
+            if (right == null) return null;
+            if (b.op.equals("+") || b.op.equals("*") || b.op.equals("==") || b.op.equals("!=")) {
+                if (left.compareTo(right) > 0) {
+                    String temp = left;
+                    left = right;
+                    right = temp;
+                }
+            }
+            return "b" + b.op + "(" + left + "," + right + ")";
+        }
+        return null;
+    }
+
+    private boolean containsCall(Expr expr) {
+        if (expr instanceof CallExpr) return true;
+        if (expr instanceof UnaryExpr u) return containsCall(u.expr);
+        if (expr instanceof BinaryExpr b) return containsCall(b.left) || containsCall(b.right);
+        return false;
+    }
+
+    private Set<String> findWrittenGlobals(Set<String> globalNames) {
+        Set<String> written = new HashSet<>();
+        for (FuncDef f : funcsFromProgram()) {
+            ArrayDeque<Set<String>> locals = new ArrayDeque<>();
+            locals.push(new HashSet<>(f.params));
+            findWrittenGlobals(f.body, globalNames, locals, written);
+        }
+        return written;
+    }
+
+    private Iterable<FuncDef> funcsFromProgram() {
+        java.util.ArrayList<FuncDef> result = new java.util.ArrayList<>();
+        for (Top top : program.tops) {
+            if (top instanceof FuncDef f) result.add(f);
+        }
+        return result;
+    }
+
+    private void findWrittenGlobals(Stmt stmt, Set<String> globalNames, ArrayDeque<Set<String>> locals, Set<String> written) {
+        if (stmt instanceof Block b) {
+            locals.push(new HashSet<>());
+            for (Stmt s : b.stmts) findWrittenGlobals(s, globalNames, locals, written);
+            locals.pop();
+        } else if (stmt instanceof DeclStmt d) {
+            locals.peek().add(d.decl.name);
+        } else if (stmt instanceof AssignStmt a) {
+            if (globalNames.contains(a.name) && !isLocal(a.name, locals)) written.add(a.name);
+        } else if (stmt instanceof IfStmt i) {
+            findWrittenGlobals(i.thenStmt, globalNames, locals, written);
+            if (i.elseStmt != null) findWrittenGlobals(i.elseStmt, globalNames, locals, written);
+        } else if (stmt instanceof WhileStmt w) {
+            findWrittenGlobals(w.body, globalNames, locals, written);
+        }
+    }
+
+    private boolean isLocal(String name, ArrayDeque<Set<String>> locals) {
+        for (Set<String> names : locals) {
+            if (names.contains(name)) return true;
+        }
+        return false;
     }
 
     private void pushA0() {
