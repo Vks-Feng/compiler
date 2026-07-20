@@ -679,6 +679,7 @@ final class CodeGen {
         Integer rightConst = tryEvalConst(right);
         if (rightConst != null) {
             emitExpr(left);
+            if (rightConst == 0 && emitZeroRelBranch(op, "a0", branchOnTrue, target)) return;
             emitLi("t1", rightConst);
             emitBranchOp(op, "a0", "t1", branchOnTrue, target);
             return;
@@ -686,6 +687,7 @@ final class CodeGen {
         Integer leftConst = tryEvalConst(left);
         if (leftConst != null) {
             emitExpr(right);
+            if (leftConst == 0 && emitZeroRelBranch(swapRelOp(op), "a0", branchOnTrue, target)) return;
             emitLi("t1", leftConst);
             emitBranchOp(op, "t1", "a0", branchOnTrue, target);
             return;
@@ -702,6 +704,32 @@ final class CodeGen {
         emitExpr(right);
         popT0();
         emitBranchOp(op, "t0", "a0", branchOnTrue, target);
+    }
+
+    private boolean emitZeroRelBranch(String op, String reg, boolean branchOnTrue, String target) {
+        String branch = switch (op) {
+            case "==" -> branchOnTrue ? "beqz" : "bnez";
+            case "!=" -> branchOnTrue ? "bnez" : "beqz";
+            case "<" -> branchOnTrue ? "bltz" : "bgez";
+            case ">=" -> branchOnTrue ? "bgez" : "bltz";
+            case ">" -> branchOnTrue ? "bgtz" : "blez";
+            case "<=" -> branchOnTrue ? "blez" : "bgtz";
+            default -> null;
+        };
+        if (branch == null) return false;
+        asm.append("  ").append(branch).append(' ').append(reg).append(", ").append(target).append('\n');
+        return true;
+    }
+
+    private String swapRelOp(String op) {
+        return switch (op) {
+            case "<" -> ">";
+            case ">" -> "<";
+            case "<=" -> ">=";
+            case ">=" -> "<=";
+            case "==", "!=" -> op;
+            default -> throw new RuntimeException("bad relation operator: " + op);
+        };
     }
 
     private void emitBranchOp(String op, String leftReg, String rightReg, boolean branchOnTrue, String target) {
@@ -728,21 +756,56 @@ final class CodeGen {
             asm.append("  call ").append(c.name).append('\n');
             return;
         }
-        int bytes = align16(c.args.size() * 4);
-        if (bytes > 0) asm.append("  addi sp, sp, -").append(bytes).append('\n');
+        boolean[] spillArgs = new boolean[c.args.size()];
+        int spillCount = 0;
         for (int i = 0; i < c.args.size(); i++) {
-            emitExpr(c.args.get(i));
-            asm.append("  sw a0, ").append(i * 4).append("(sp)\n");
+            // a0 is also the expression-result register, so it cannot retain a value while
+            // later arguments are evaluated.  Other argument registers only need spilling
+            // when a later call may clobber them.
+            spillArgs[i] = i >= 8 || !isSimpleExpr(c.args.get(i)) ||
+                    (i == 0 && i + 1 < c.args.size()) ||
+                    (i > 0 && hasCallAfter(c.args, i));
+            if (spillArgs[i]) spillCount++;
+        }
+        int bytes = align16((spillCount + Math.max(0, c.args.size() - 8)) * 4);
+        if (bytes > 0) asm.append("  addi sp, sp, -").append(bytes).append('\n');
+        int[] spillOffsets = new int[c.args.size()];
+        int nextSpill = 0;
+        for (int i = 0; i < c.args.size(); i++) {
+            if (spillArgs[i]) {
+                emitExpr(c.args.get(i));
+                spillOffsets[i] = nextSpill++ * 4;
+                asm.append("  sw a0, ").append(spillOffsets[i]).append("(sp)\n");
+            } else {
+                emitSimpleExprToReg(c.args.get(i), "a" + i);
+            }
         }
         for (int i = 0; i < Math.min(8, c.args.size()); i++) {
-            asm.append("  lw a").append(i).append(", ").append(i * 4).append("(sp)\n");
+            if (spillArgs[i]) {
+                asm.append("  lw a").append(i).append(", ").append(spillOffsets[i]).append("(sp)\n");
+            }
         }
         for (int i = 8; i < c.args.size(); i++) {
-            asm.append("  lw t0, ").append(i * 4).append("(sp)\n");
+            if (spillArgs[i]) {
+                asm.append("  lw t0, ").append(spillOffsets[i]).append("(sp)\n");
+            } else {
+                emitSimpleExprToReg(c.args.get(i), "t0");
+            }
+            // Stack-passed arguments must start at the current sp: the callee reads
+            // them through its incoming frame pointer.  At this point register
+            // arguments have already been restored, so these slots may reuse the
+            // temporary area.
             asm.append("  sw t0, ").append((i - 8) * 4).append("(sp)\n");
         }
         asm.append("  call ").append(c.name).append('\n');
         if (bytes > 0) asm.append("  addi sp, sp, ").append(bytes).append('\n');
+    }
+
+    private boolean hasCallAfter(java.util.List<Expr> args, int index) {
+        for (int i = index + 1; i < args.size(); i++) {
+            if (containsCall(args.get(i))) return true;
+        }
+        return false;
     }
 
     private void emitTailCall(CallExpr c) {
