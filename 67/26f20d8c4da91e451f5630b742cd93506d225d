@@ -1,0 +1,21 @@
+src/main/java/toyc/CodeGen.java
+  s_d20e3644569d22::t_24c0cc159c9225 682,690,709-734,759-770,772-773,775-781,784-786,789-797,804-810
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6726f20d8c4da91e451f5630b742cd93506d225d",
+  "prompts": {},
+  "sessions": {
+    "s_d20e3644569d22": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f7e75-ddc4-7853-bdf7-1409a9363599",
+        "model": "unknown"
+      },
+      "human_author": "lianzisen <lianzisen@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
